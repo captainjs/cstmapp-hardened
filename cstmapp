@@ -90,11 +90,19 @@ class AppManager:
 
     # >>> NEW: pre-flight container-name conflict check ----------------------
     def get_compose_container_names(self, compose_dict):
-        names = []
-        for svc in (compose_dict.get("services") or {}).values():
-            if isinstance(svc, dict) and svc.get("container_name"):
-                names.append(svc["container_name"])
-        return names
+    names = []
+    # follow include: directives (compose merges these at runtime)
+    for inc in (compose_dict.get("include") or []):
+        path = inc.get("path") if isinstance(inc, dict) else inc
+        if path and os.path.exists(path):
+            with open(path) as f:
+                sub = yaml.safe_load(f) or {}
+            names += self.get_compose_container_names(sub)
+    for svc in (compose_dict.get("services") or {}).values():
+        if isinstance(svc, dict) and svc.get("container_name"):
+            names.append(svc["container_name"])
+    return names
+
 
     def check_container_conflicts(self, compose_dict, app_name, force=False):
         names = self.get_compose_container_names(compose_dict)
