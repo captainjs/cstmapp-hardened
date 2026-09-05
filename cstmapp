@@ -7,18 +7,19 @@ import argparse
 import os
 import re
 import shutil
+import time
 
 class AppManager:
     def __init__(self):
         self.midclt_path = self._get_midclt_path()
-    
+
     def _get_midclt_path(self):
         midclt_path = shutil.which("midclt")
         if not midclt_path:
             print("Error: midclt command not found in PATH.")
             sys.exit(1)
         return midclt_path
-    
+
     def query_apps(self, params):
         proc = subprocess.run([self.midclt_path, "call", "app.query", params], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
@@ -29,7 +30,7 @@ class AppManager:
         except json.JSONDecodeError as e:
             print(f"Error parsing JSON response: {e}")
             sys.exit(1)
-    
+
     def get_app_config(self, app_name):
         if not self.check_app_exists(app_name):
             print(f"Error: App '{app_name}' does not exist.")
@@ -85,10 +86,52 @@ class AppManager:
         except Exception as e:
             print(f"Error reading compose file: {e}")
             sys.exit(1)
-        return yaml.dump(compose_file)
+        return yaml.dump(compose_file), compose_file
+
+    # >>> NEW: pre-flight container-name conflict check ----------------------
+    def get_compose_container_names(self, compose_dict):
+        names = []
+        for svc in (compose_dict.get("services") or {}).values():
+            if isinstance(svc, dict) and svc.get("container_name"):
+                names.append(svc["container_name"])
+        return names
+
+    def check_container_conflicts(self, compose_dict, app_name, force=False):
+        names = self.get_compose_container_names(compose_dict)
+        if not names:
+            return
+        pattern = "^(" + "|".join(names) + ")$"
+        proc = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"name={pattern}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        existing_ids = proc.stdout.decode().split()
+        if not existing_ids:
+            return
+
+        if not force:
+            print(f"Error: {len(existing_ids)} container(s) already exist with name(s) app '{app_name}' needs, "
+                  f"and are NOT tracked by middleware for this app:")
+            detail = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={pattern}",
+                 "--format", "  {{.Names}}\t{{.State}}\t{{.Status}}"],
+                stdout=subprocess.PIPE
+            )
+            print(detail.stdout.decode())
+            print("Refusing to proceed and risk app.create/app.update hanging on a name conflict.")
+            print("Re-run with --force to remove these containers first, then retry.")
+            sys.exit(1)
+        else:
+            print(f"--force given: removing {len(existing_ids)} conflicting container(s) before proceeding...")
+            for cid in existing_ids:
+                rm = subprocess.run(["docker", "rm", "-f", cid], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if rm.returncode != 0:
+                    print(f"Error removing container {cid}: {rm.stderr.decode()}")
+                    sys.exit(1)
+    # <<< END NEW --------------------------------------------------------------
 
 class JobExecutor:
-    def execute_job_and_report_progress(self, cmd_array, midclt_path):
+    def execute_job_and_report_progress(self, cmd_array, midclt_path, timeout_seconds=600):
         proc_cmd = subprocess.run(cmd_array, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc_cmd.returncode != 0:
             print(f"Error executing command: {proc_cmd.stderr.decode()}")
@@ -100,28 +143,53 @@ class JobExecutor:
             print(f"Error decoding command output: {e}")
             sys.exit(1)
 
+        start_time = time.time()
         job_percent_complete = 0
         job_state = "RUNNING"
+        last_result = None
 
-        while job_percent_complete < 100 and job_state != "FAILED":
+        # >>> CHANGED: also stop on ABORTED/ERROR, not just FAILED
+        while job_percent_complete < 100 and job_state not in ("FAILED", "ABORTED", "ERROR"):
+            if time.time() - start_time > timeout_seconds:
+                print(f"\nError: job {job_id} did not complete within {timeout_seconds}s "
+                      f"(last state: {job_state}, {job_percent_complete}%).")
+                print("The underlying operation may still be running server-side — check manually before retrying.")
+                sys.exit(1)
+
             proc_wait = subprocess.run([midclt_path, "call", "core.get_jobs", f'[["id","=",{job_id}]]'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if proc_wait.returncode != 0:
                 print(f"Error getting job status: {proc_wait.stderr.decode()}")
-                break
+                sys.exit(1)
 
             try:
                 wait_result = json.loads(proc_wait.stdout)
                 if not wait_result:
                     print("Error: No job found")
-                    break
-                job_percent_complete = wait_result[0]['progress']['percent']
-                job_state = wait_result[0]['state']
-                print(f"\r\x1b[K{wait_result[0]['progress']['description']} (progress: {wait_result[0]['progress']['percent']}% -> {wait_result[0]['state']})", end="")
+                    sys.exit(1)
+                last_result = wait_result[0]
+                job_percent_complete = last_result['progress']['percent']
+                job_state = last_result['state']
+                print(f"\r\x1b[K{last_result['progress']['description']} (progress: {job_percent_complete}% -> {job_state})", end="")
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 print(f"Error parsing job status: {e}")
-                break
+                sys.exit(1)
+
+            if job_state not in ("SUCCESS", "FAILED", "ABORTED", "ERROR"):
+                time.sleep(1)
 
         print()
+
+        # >>> NEW: actually check outcome instead of trusting stdout text elsewhere
+        if job_state != "SUCCESS":
+            print(f"JOB {job_state}: {job_id}")
+            if last_result:
+                err = last_result.get("error") or last_result.get("exc_info") or last_result.get("exception")
+                if err:
+                    print(f"Reason: {err}")
+            sys.exit(1)
+        else:
+            print(f"JOB SUCCESS: {job_id}")
+        # <<< END NEW
 
 class CommandHandler:
     def __init__(self):
@@ -155,7 +223,7 @@ class CommandHandler:
         else:
             print(json.dumps(app_details[0], indent=4))
 
-    def config_app(self, app_name,is_compact, is_yaml):
+    def config_app(self, app_name, is_compact, is_yaml):
         app_config = self.app_manager.get_app_config(app_name)
         if not app_config:
             print(f"Error: App '{app_name}' not found.")
@@ -167,14 +235,15 @@ class CommandHandler:
         else:
             print(json.dumps(app_config, indent=4))
 
-    def create_app(self, app_name, file_path):
+    def create_app(self, app_name, file_path, force=False):
         self.app_manager.validate_app_name(app_name)
 
         if self.app_manager.check_app_exists(app_name):
             print(f"Error: App '{app_name}' already exists.")
             sys.exit(1)
 
-        compose_file_str = self.app_manager.read_compose_file(file_path)
+        compose_file_str, compose_dict = self.app_manager.read_compose_file(file_path)
+        self.app_manager.check_container_conflicts(compose_dict, app_name, force=force)  # >>> NEW
         params = json.dumps({
             "app_name": app_name,
             "custom_app": True,
@@ -182,12 +251,13 @@ class CommandHandler:
         })
         self.job_executor.execute_job_and_report_progress([self.app_manager.midclt_path, "call", "app.create", params], self.app_manager.midclt_path)
 
-    def update_app(self, app_name, file_path):
+    def update_app(self, app_name, file_path, force=False):
         if not self.app_manager.check_app_exists(app_name):
             print(f"Error: App '{app_name}' does not exist.")
             sys.exit(1)
 
-        compose_file_str = self.app_manager.read_compose_file(file_path)
+        compose_file_str, compose_dict = self.app_manager.read_compose_file(file_path)
+        # NOTE: no conflict check on update — the app already owns these container names in middleware.
         params = json.dumps({"custom_compose_config_string": compose_file_str})
         self.job_executor.execute_job_and_report_progress([self.app_manager.midclt_path, "call", "app.update", app_name, params], self.app_manager.midclt_path)
 
@@ -200,18 +270,19 @@ class CommandHandler:
 
     def execute_compose_command(self, app_name, file_path, unknown_args):
         compose_file = self.app_manager.find_compose_file(file_path)
-        cmd = ['docker', 'compose', '-f', compose_file, '-p', f'ix-{app_name}' ] + unknown_args
+        cmd = ['docker', 'compose', '-f', compose_file, '-p', f'ix-{app_name}'] + unknown_args
         print(cmd)
         subprocess.run(cmd)
 
 class ArgumentParser:
     @staticmethod
     def configure_argparser():
-        parser = argparse.ArgumentParser(description='TrueNAS Custom App Control')
+        parser = argparse.ArgumentParser(description='TrueNAS Custom App Control (hardened)')
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
         create_parser = subparsers.add_parser('create', help='Create a new app')
         create_parser.add_argument('--file', '-f', help='Docker compose file')
+        create_parser.add_argument('--force', action='store_true', help='Remove conflicting containers before creating')
         create_parser.add_argument('app_name', nargs='?', help='Name of the app (defaults to current directory name)')
 
         update_parser = subparsers.add_parser('update', help='Update an existing app')
@@ -220,6 +291,7 @@ class ArgumentParser:
 
         up_parser = subparsers.add_parser('up', help='Create a new app or update an existing app')
         up_parser.add_argument('--file', '-f', help='Docker compose file')
+        up_parser.add_argument('--force', action='store_true', help='Remove conflicting containers before creating (only applies if app does not yet exist)')
         up_parser.add_argument('app_name', nargs='?', help='Name of the app (defaults to current directory name)')
 
         delete_parser = subparsers.add_parser('delete', help='Delete an app')
@@ -269,9 +341,10 @@ def main():
     args, unknown_args = ArgumentParser.configure_argparser()
     handler = CommandHandler()
 
-    # Use current directory name if app_name not provided
     if hasattr(args, 'app_name') and not args.app_name:
         args.app_name = os.path.basename(os.getcwd())
+
+    force = getattr(args, 'force', False)
 
     if args.command == 'list':
         handler.list_apps(args.all)
@@ -280,12 +353,12 @@ def main():
     elif args.command == 'config':
         handler.config_app(args.app_name, args.compact, args.yaml)
     elif args.command == 'create':
-        handler.create_app(args.app_name, args.file)
+        handler.create_app(args.app_name, args.file, force=force)
     elif args.command == 'update':
         handler.update_app(args.app_name, args.file)
     elif args.command == 'up':
         if not handler.app_manager.check_app_exists(args.app_name):
-            handler.create_app(args.app_name, args.file)
+            handler.create_app(args.app_name, args.file, force=force)
         else:
             handler.update_app(args.app_name, args.file)
     elif args.command == 'down':
