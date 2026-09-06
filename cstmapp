@@ -7,7 +7,6 @@ import argparse
 import os
 import re
 import time
-import inspect
 
 from truenas_api_client import Client
 
@@ -29,30 +28,13 @@ class Middleware:
     25.10.x. Going in-process avoids the CLI entirely.
     """
 
-    def __init__(self):
-        # Detect once whether Client.call accepts a progress callback kwarg.
-        try:
-            self._supports_callback = "callback" in inspect.signature(Client.call).parameters
-        except (ValueError, TypeError):
-            self._supports_callback = False
-
     def call(self, method, *params):
         with Client() as c:
             return c.call(method, *params)
 
     def call_job(self, method, *params, timeout=600):
-        def _progress(job):
-            p = (job or {}).get("progress") or {}
-            print(f"\r\x1b[K{p.get('description', '')} "
-                  f"(progress: {p.get('percent', 0)}% -> {job.get('state')})", end="")
-
         with Client() as c:
-            if self._supports_callback:
-                res = c.call(method, *params, job=True, callback=_progress, timeout=timeout)
-            else:
-                res = c.call(method, *params, job=True, timeout=timeout)
-        print()
-        return res
+            return c.call(method, *params, job=True, timeout=timeout)
 
 
 class AppManager:
