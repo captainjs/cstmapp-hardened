@@ -142,7 +142,9 @@ class JobExecutor:
     def execute_job_and_report_progress(self, cmd_array, midclt_path, timeout_seconds=600):
         proc_cmd = subprocess.run(cmd_array, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc_cmd.returncode != 0:
-            print(f"Error executing command: {proc_cmd.stderr.decode()}")
+            print(f"Error executing command (rc={proc_cmd.returncode})")
+            print(f"STDOUT: {proc_cmd.stdout.decode()}")
+            print(f"STDERR: {proc_cmd.stderr.decode()}")
             sys.exit(1)
 
         try:
