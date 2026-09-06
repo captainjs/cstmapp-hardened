@@ -6,56 +6,80 @@ import subprocess
 import argparse
 import os
 import re
-import shutil
 import time
+import inspect
+
+from truenas_api_client import Client
+
+# ClientException import is version-dependent; fall back to Exception.
+try:
+    from truenas_api_client.exc import ClientException
+except Exception:  # pragma: no cover
+    try:
+        from truenas_api_client import ClientException
+    except Exception:
+        ClientException = Exception
+
+
+class Middleware:
+    """In-process middleware client.
+
+    Replaces the `midclt call ...` subprocess path, which gets SIGKILLed on
+    large argv payloads (e.g. multi-service app.create/update) on TrueNAS
+    25.10.x. Going in-process avoids the CLI entirely.
+    """
+
+    def __init__(self):
+        # Detect once whether Client.call accepts a progress callback kwarg.
+        try:
+            self._supports_callback = "callback" in inspect.signature(Client.call).parameters
+        except (ValueError, TypeError):
+            self._supports_callback = False
+
+    def call(self, method, *params):
+        with Client() as c:
+            return c.call(method, *params)
+
+    def call_job(self, method, *params, timeout=600):
+        def _progress(job):
+            p = (job or {}).get("progress") or {}
+            print(f"\r\x1b[K{p.get('description', '')} "
+                  f"(progress: {p.get('percent', 0)}% -> {job.get('state')})", end="")
+
+        with Client() as c:
+            if self._supports_callback:
+                res = c.call(method, *params, job=True, callback=_progress, timeout=timeout)
+            else:
+                res = c.call(method, *params, job=True, timeout=timeout)
+        print()
+        return res
+
 
 class AppManager:
     def __init__(self):
-        self.midclt_path = self._get_midclt_path()
+        self.mw = Middleware()
 
-    def _get_midclt_path(self):
-        midclt_path = shutil.which("midclt")
-        if not midclt_path:
-            print("Error: midclt command not found in PATH.")
-            sys.exit(1)
-        return midclt_path
-
-    def query_apps(self, params):
-        proc = subprocess.run([self.midclt_path, "call", "app.query", params], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if proc.returncode != 0:
-            print(f"Error querying apps: {proc.stderr.decode()}")
-            sys.exit(1)
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON response: {e}")
-            sys.exit(1)
+    def query_apps(self, filters):
+        # filters is a Python list (middleware query-filters syntax).
+        return self.mw.call("app.query", filters)
 
     def get_app_config(self, app_name):
         if not self.check_app_exists(app_name):
             print(f"Error: App '{app_name}' does not exist.")
             sys.exit(1)
-        proc = subprocess.run([self.midclt_path, "call", "app.config", app_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if proc.returncode != 0:
-            print(f"Error querying apps: {proc.stderr.decode()}")
-            sys.exit(1)
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON response: {e}")
-            sys.exit(1)
+        return self.mw.call("app.config", app_name)
 
     def check_app_exists(self, app_name):
-        params = f'[["name","=","{app_name}"]]'
-        result = self.query_apps(params)
-        return len(result) > 0
+        return len(self.query_apps([["name", "=", app_name]])) > 0
 
     def validate_app_name(self, app_name):
         if not app_name or not isinstance(app_name, str):
             print("Error: App name must be a non-empty string.")
             sys.exit(1)
         if not re.match(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', app_name) or len(app_name) > 40:
-            print("Error: App name must be 1-40 characters long, start with a letter, end with alphanumeric, and contain only lowercase letters, numbers and hyphens (not at start/end).")
+            print("Error: App name must be 1-40 characters long, start with a letter, "
+                  "end with alphanumeric, and contain only lowercase letters, numbers "
+                  "and hyphens (not at start/end).")
             sys.exit(1)
 
     def find_compose_file(self, file_path):
@@ -88,10 +112,9 @@ class AppManager:
             sys.exit(1)
         return yaml.dump(compose_file), compose_file
 
-    # >>> NEW: pre-flight container-name conflict check ----------------------
+    # --- pre-flight container-name conflict check ---------------------------
     def get_compose_container_names(self, compose_dict):
         names = []
-        # follow include: directives (compose merges these at runtime)
         for inc in (compose_dict.get("include") or []):
             path = inc.get("path") if isinstance(inc, dict) else inc
             if path and os.path.exists(path):
@@ -102,7 +125,6 @@ class AppManager:
             if isinstance(svc, dict) and svc.get("container_name"):
                 names.append(svc["container_name"])
         return names
-
 
     def check_container_conflicts(self, compose_dict, app_name, force=False):
         names = self.get_compose_container_names(compose_dict)
@@ -136,82 +158,16 @@ class AppManager:
                 if rm.returncode != 0:
                     print(f"Error removing container {cid}: {rm.stderr.decode()}")
                     sys.exit(1)
-    # <<< END NEW --------------------------------------------------------------
+    # --- end conflict check --------------------------------------------------
 
-class JobExecutor:
-    def execute_job_and_report_progress(self, cmd_array, midclt_path, timeout_seconds=600):
-        proc_cmd = subprocess.run(cmd_array, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if proc_cmd.returncode != 0:
-            print(f"Error executing command (rc={proc_cmd.returncode})")
-            print(f"STDOUT: {proc_cmd.stdout.decode()}")
-            print(f"STDERR: {proc_cmd.stderr.decode()}")
-            sys.exit(1)
-
-        try:
-            job_id = proc_cmd.stdout.decode().strip()
-        except UnicodeDecodeError as e:
-            print(f"Error decoding command output: {e}")
-            sys.exit(1)
-
-        start_time = time.time()
-        job_percent_complete = 0
-        job_state = "RUNNING"
-        last_result = None
-
-        # >>> CHANGED: also stop on ABORTED/ERROR, not just FAILED
-        while job_percent_complete < 100 and job_state not in ("FAILED", "ABORTED", "ERROR"):
-            if time.time() - start_time > timeout_seconds:
-                print(f"\nError: job {job_id} did not complete within {timeout_seconds}s "
-                      f"(last state: {job_state}, {job_percent_complete}%).")
-                print("The underlying operation may still be running server-side — check manually before retrying.")
-                sys.exit(1)
-
-            proc_wait = subprocess.run([midclt_path, "call", "core.get_jobs", f'[["id","=",{job_id}]]'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc_wait.returncode != 0:
-                print(f"Error getting job status: {proc_wait.stderr.decode()}")
-                sys.exit(1)
-
-            try:
-                wait_result = json.loads(proc_wait.stdout)
-                if not wait_result:
-                    print("Error: No job found")
-                    sys.exit(1)
-                last_result = wait_result[0]
-                job_percent_complete = last_result['progress']['percent']
-                job_state = last_result['state']
-                print(f"\r\x1b[K{last_result['progress']['description']} (progress: {job_percent_complete}% -> {job_state})", end="")
-            except (json.JSONDecodeError, KeyError, IndexError) as e:
-                print(f"Error parsing job status: {e}")
-                sys.exit(1)
-
-            if job_state not in ("SUCCESS", "FAILED", "ABORTED", "ERROR"):
-                time.sleep(1)
-
-        print()
-
-        # >>> NEW: actually check outcome instead of trusting stdout text elsewhere
-        if job_state != "SUCCESS":
-            print(f"JOB {job_state}: {job_id}")
-            if last_result:
-                err = last_result.get("error") or last_result.get("exc_info") or last_result.get("exception")
-                if err:
-                    print(f"Reason: {err}")
-            sys.exit(1)
-        else:
-            print(f"JOB SUCCESS: {job_id}")
-        # <<< END NEW
 
 class CommandHandler:
     def __init__(self):
         self.app_manager = AppManager()
-        self.job_executor = JobExecutor()
 
     def list_apps(self, all):
-        if all:
-            params = '[]'
-        else:
-            params = '[["custom_app","=",true]]'
-        app_list = self.app_manager.query_apps(params)
+        filters = [] if all else [["custom_app", "=", True]]
+        app_list = self.app_manager.query_apps(filters)
         if len(app_list) > 0:
             print("Deployed Custom Apps:")
             print("  APP_NAME                                 STATE      APP")
@@ -221,8 +177,7 @@ class CommandHandler:
             print("No deployed custom apps found.")
 
     def inspect_app(self, app_name, is_compact, is_yaml):
-        params = f'[["name","=","{app_name}"]]'
-        app_details = self.app_manager.query_apps(params)
+        app_details = self.app_manager.query_apps([["name", "=", app_name]])
         if not app_details:
             print(f"Error: App '{app_name}' not found.")
             sys.exit(1)
@@ -247,42 +202,42 @@ class CommandHandler:
 
     def create_app(self, app_name, file_path, force=False):
         self.app_manager.validate_app_name(app_name)
-
         if self.app_manager.check_app_exists(app_name):
             print(f"Error: App '{app_name}' already exists.")
             sys.exit(1)
-
         compose_file_str, compose_dict = self.app_manager.read_compose_file(file_path)
-        self.app_manager.check_container_conflicts(compose_dict, app_name, force=force)  # >>> NEW
-        params = json.dumps({
+        self.app_manager.check_container_conflicts(compose_dict, app_name, force=force)
+        res = self.app_manager.mw.call_job("app.create", {
             "app_name": app_name,
             "custom_app": True,
-            "custom_compose_config_string": compose_file_str
+            "custom_compose_config_string": compose_file_str,
         })
-        self.job_executor.execute_job_and_report_progress([self.app_manager.midclt_path, "call", "app.create", params], self.app_manager.midclt_path)
+        name = res.get("name", app_name) if isinstance(res, dict) else app_name
+        print(f"JOB SUCCESS: {name}")
 
     def update_app(self, app_name, file_path, force=False):
         if not self.app_manager.check_app_exists(app_name):
             print(f"Error: App '{app_name}' does not exist.")
             sys.exit(1)
-
-        compose_file_str, compose_dict = self.app_manager.read_compose_file(file_path)
-        # NOTE: no conflict check on update — the app already owns these container names in middleware.
-        params = json.dumps({"custom_compose_config_string": compose_file_str})
-        self.job_executor.execute_job_and_report_progress([self.app_manager.midclt_path, "call", "app.update", app_name, params], self.app_manager.midclt_path)
+        compose_file_str, _ = self.app_manager.read_compose_file(file_path)
+        self.app_manager.mw.call_job("app.update", app_name, {
+            "custom_compose_config_string": compose_file_str,
+        })
+        print(f"JOB SUCCESS: {app_name}")
 
     def execute_app_command(self, app_name, command):
         if not self.app_manager.check_app_exists(app_name):
             print(f"Error: App '{app_name}' does not exist.")
             sys.exit(1)
-        action = f"app.{command}"
-        self.job_executor.execute_job_and_report_progress([self.app_manager.midclt_path, "call", action, app_name], self.app_manager.midclt_path)
+        self.app_manager.mw.call_job(f"app.{command}", app_name)
+        print(f"JOB SUCCESS: {app_name} ({command})")
 
     def execute_compose_command(self, app_name, file_path, unknown_args):
         compose_file = self.app_manager.find_compose_file(file_path)
         cmd = ['docker', 'compose', '-f', compose_file, '-p', f'ix-{app_name}'] + unknown_args
         print(cmd)
         subprocess.run(cmd)
+
 
 class ArgumentParser:
     @staticmethod
@@ -347,6 +302,7 @@ class ArgumentParser:
 
         return args, unknown_args
 
+
 def main():
     args, unknown_args = ArgumentParser.configure_argparser()
     handler = CommandHandler()
@@ -356,30 +312,35 @@ def main():
 
     force = getattr(args, 'force', False)
 
-    if args.command == 'list':
-        handler.list_apps(args.all)
-    elif args.command == 'inspect':
-        handler.inspect_app(args.app_name, args.compact, args.yaml)
-    elif args.command == 'config':
-        handler.config_app(args.app_name, args.compact, args.yaml)
-    elif args.command == 'create':
-        handler.create_app(args.app_name, args.file, force=force)
-    elif args.command == 'update':
-        handler.update_app(args.app_name, args.file)
-    elif args.command == 'up':
-        if not handler.app_manager.check_app_exists(args.app_name):
+    try:
+        if args.command == 'list':
+            handler.list_apps(args.all)
+        elif args.command == 'inspect':
+            handler.inspect_app(args.app_name, args.compact, args.yaml)
+        elif args.command == 'config':
+            handler.config_app(args.app_name, args.compact, args.yaml)
+        elif args.command == 'create':
             handler.create_app(args.app_name, args.file, force=force)
-        else:
+        elif args.command == 'update':
             handler.update_app(args.app_name, args.file)
-    elif args.command == 'down':
-        handler.execute_app_command(args.app_name, 'delete')
-    elif args.command == 'restart':
-        handler.execute_app_command(args.app_name, 'stop')
-        handler.execute_app_command(args.app_name, 'start')
-    elif args.command == 'compose':
-        handler.execute_compose_command(args.app_name, args.file, unknown_args)
-    else:
-        handler.execute_app_command(args.app_name, args.command)
+        elif args.command == 'up':
+            if not handler.app_manager.check_app_exists(args.app_name):
+                handler.create_app(args.app_name, args.file, force=force)
+            else:
+                handler.update_app(args.app_name, args.file)
+        elif args.command == 'down':
+            handler.execute_app_command(args.app_name, 'delete')
+        elif args.command == 'restart':
+            handler.execute_app_command(args.app_name, 'stop')
+            handler.execute_app_command(args.app_name, 'start')
+        elif args.command == 'compose':
+            handler.execute_compose_command(args.app_name, args.file, unknown_args)
+        else:
+            handler.execute_app_command(args.app_name, args.command)
+    except ClientException as e:
+        print(f"\nJOB FAILED: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
